@@ -1,5 +1,5 @@
 # Distributed-System
 
-##Lab1  MapReduce(done)
+##Lab1  MapReduce
 
-##Lab2  Raft(doing)
+##Lab2  Raft

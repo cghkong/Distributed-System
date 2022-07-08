@@ -1,4 +1,4 @@
-# Distributed-System
+# Distributed-System（MIT 6.824）
 
 ## Lab1  MapReduce
 实现一个分布式MapReduce计算模型，主要逻辑分为协调器(coordinator)和工作器(worker)
@@ -227,7 +227,7 @@ func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) erro
 		// if all maps are in progress and haven't timed out,wait to give another task
 
 		if !mapDone {
-			// TODO wait
+			// wait
 			time.Sleep(time.Second)
 		} else {
 			// we are been done all map tasks! yeah
@@ -296,4 +296,395 @@ func (c *Coordinator) HandleFinishedTask(args *FinishedTaskArgs, reply *Finished
 1. worker超时执行会导致coordinator认为worker执行失败，重置该任务，然后发布给其它的worker执行
 
 ## Lab2  Raft
+Raft是一种易于理解的共识算法，它可以产生和multi Paxos等价的效果。共识算法使得集群在有成员发送宕机的情况仍能提高可靠的服务，在大规模高可用的系统中具有重要意义。
+Raft算法将问题划分为三个子问题（leader选举、日记复制、安全性）来解决。
+
+**强烈建议**实现时参考MIT助教的指导说明https://thesquareplanet.com/blog/students-guide-to-raft/
+和加锁建议https://pdos.csail.mit.edu/6.824/labs/raft-locking.txt
+
+### Leader Election
+
+#### Raft结构体设计
+```
+const (
+	FOLLOWER     = 0
+	CANDIDATE    = 1
+	LEADER       = 2
+}
+
+ type Raft struct {
+	mu                           sync.Mutex          // Lock to protect shared access to this peer's state
+	peers                        []*labrpc.ClientEnd // RPC end points of all peers
+	persister                    *Persister          // Object to hold this peer's persisted state
+	me                           int                 // this peer's index into peers[]
+	dead                         int32               // set by Kill()
+
+	currentTerm                  int
+	votedFor                     int
+	getVoteNum                   int
+	log                          []LogEntry
+
+	commitIndex                  int
+	lastApplied                  int
+
+	state int
+	lastResetElectionTime        time.Time
+
+        nextIndex                    []int
+	matchIndex                   []int
+
+	applyCh                      chan ApplyMsg
+	
+	// used for snapshot
+	lastSnapShotIndex            int
+	lastSnapShotTerm             int
+}
+
+//LogEntry design
+type Entry struct {
+	Term    int
+	Command interface{}
+}
+```
+
+#### 2 Leader Election
+##### 2.1 请求投票的参数和应答参数的结构体设计
+```
+type RequestVoteArgs struct {
+	// Your data here (2A, 2B).
+	Term int
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
+}
+
+type RequestVoteReply struct {
+	// Your data here (2A).
+	Term int
+	VoteGranted bool
+}
+```
+
+##### 2.2 leader选举算法实现
+如果某个服务器结点的选举时间到期，则会重置选举超时时间，并且它会转化为候选者发起新的一轮选举并给自己投一票，然后并行地向其它结点发送投票请求。
+2.2.1 如果其它结点的任期大于请求的任期，那么它不能获得那个结点的选票（因为日记一致性的需要）。
+2.2.2 如果其它结点还没有投票并且候选者比本地日记新，则候选者可以获得该结点的选票
+2.2.3 如果候选者获得的选票超过一半，则选举胜出，成为新的leader，向其它结点广播心跳
+
+```
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	
+	if args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	reply.Term = rf.currentTerm
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.changeState(TO_FOLLOWER,false)
+		rf.persist()
+	}
+
+	if rf.UpToDate(args.LastLogIndex,args.LastLogTerm) == false {
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// arg.Term == rf.currentTerm
+	if rf.votedFor != -1 && rf.votedFor != args.CandidateId && args.Term == reply.Term {
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	}else {
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+		rf.currentTerm = args.Term
+		reply.Term = rf.currentTerm
+		rf.lastResetElectionTime = time.Now()
+		rf.persist()
+		return
+	}
+	return
+}
+
+func (rf *Raft) StartElection(){
+	for index := range rf.peers{
+		if index == rf.me{
+			continue
+		}
+
+		go func(server int){
+			rf.mu.Lock()
+			rvArgs := RequestVoteArgs{
+				rf.currentTerm,
+				rf.me,
+				rf.getLastIndex(),
+				rf.getLastTerm(),
+			}
+			rvReply := RequestVoteReply{}
+			rf.mu.Unlock()
+			// waiting code should free lock first.
+			re := rf.sendRequestVote(server,&rvArgs,&rvReply)
+			if re == true {
+				rf.mu.Lock()
+			        // 抛弃过期的请求
+				if rf.state != CANDIDATE || rvArgs.Term < rf.currentTerm{
+					rf.mu.Unlock()
+					return
+				}
+
+				if rvReply.VoteGranted == true && rf.currentTerm == rvArgs.Term{
+					rf.getVoteNum += 1
+					if rf.getVoteNum >= len(rf.peers)/2+1 {
+						DPrintf("[LeaderSuccess+++++] %d got votenum: %d, needed >= %d, become leader for term %d",rf.me,rf.getVoteNum,len(rf.peers)/2+1,rf.currentTerm)
+						rf.changeState(TO_LEADER,true)
+						rf.mu.Unlock()
+						return
+					}
+					rf.mu.Unlock()
+					return
+				}
+                                // 其它结点率先选举胜出，成为leader
+				if rvReply.Term > rvArgs.Term {
+					if rf.currentTerm < rvReply.Term{
+						rf.currentTerm = rvReply.Term
+					}
+					rf.changeState(TO_FOLLOWER,false)
+					rf.mu.Unlock()
+					return
+				}
+
+				rf.mu.Unlock()
+				return
+			}
+
+		}(index)
+
+	}
+
+}
+
+```
+注意点：
+1. 利用Go函数闭包来实现投票统计
+
+2. 抛弃过期请求的恢复
+
+3. 判断投票过程中是否有其它结点率先成为新的leader
+
+
+#### 日记复制
+日记复制是raft算法的难点，主要逻辑是leader定期向所有的Follower发送心跳和追加日记
+
+##### 追加日记的逻辑实现（具体参考论文，引入snapshot之后会进一步完善）：
+
+1. 如果某服务器结点的任期大于leader的任期，返回false（过期的请求直接抛弃）
+2. 如果某服务器结点不存在和leader的前一条日记的索引和任期匹配的日记，返回false
+3. 如果某服务器存在一条日记的索引和leader的前一条日记的索引相同，任期不同，则截断这条日记及之后的所有的日记（维护日记的一致性，没有被上一任期的leader提交并且持久化）
+4. 如果leader将要复制的日记，本地服务器没有，则直接追加到存储
+5. 如果leaderCommit > commitIndex，则将本地commitIndex = min (最新的日记的索引，leaderCommit)
+
+发送心跳的目的：重置结点的选举超时时间
+```
+// 追加日记
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// rule 1
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		reply.ConflictingIndex = -1
+		return
+	}
+
+	rf.currentTerm = args.Term
+	
+	reply.Term = rf.currentTerm
+	reply.Success = true
+	reply.ConflictingIndex = -1
+
+	if rf.state!=FOLLOWER{
+		rf.changeState(TO_FOLLOWER,true)
+	}else{
+		rf.lastResetElectionTime = time.Now()
+		rf.persist()
+	}
+	
+	if rf.lastSSPointIndex > args.PrevLogIndex{
+		reply.Success = false
+		reply.ConflictingIndex = rf.getLastIndex() + 1
+		return
+	}
+
+	if rf.getLastIndex() < args.PrevLogIndex {
+		reply.Success = false
+		reply.ConflictingIndex = rf.getLastIndex()
+		return
+	} else {
+		if rf.getLogTermWithIndex(args.PrevLogIndex) != args.PrevLogTerm{
+			reply.Success = false
+			tempTerm := rf.getLogTermWithIndex(args.PrevLogIndex)
+			for index := args.PrevLogIndex;index >= rf.lastSSPointIndex;index--{
+				if rf.getLogTermWithIndex(index) != tempTerm{
+					reply.ConflictingIndex = index+1
+					break
+				}
+			}
+			return
+		}
+	}
+
+	rf.log = append(rf.log[:args.PrevLogIndex+1-rf.lastSSPointIndex],args.Entries...)
+	rf.persist()
+	//rule 5
+	if args.LeaderCommit > rf.commitIndex {
+		rf.updateCommitIndex(FOLLOWER, args.LeaderCommit)
+	}
+	
+	return
+}
+
+
+// 将心跳和追加日记放到一起实现
+func (rf *Raft) LeaderAppendEntries(){
+	// send to every server to replicate logs to them
+	for index := range rf.peers{
+		if index == rf.me {
+			continue
+		}
+		// parallel replicate logs to sever
+
+		go func(server int){
+			rf.mu.Lock()
+		        // 判断是否是leader调用
+			if rf.state!=LEADER{
+				rf.mu.Unlock()
+				return
+			}
+			prevLogIndextemp := rf.nextIndex[server]-1
+			// 日记压缩2D
+			if prevLogIndextemp < rf.lastSSPointIndex{
+				go rf.leaderSendSnapShot(server)
+				rf.mu.Unlock()
+				return
+			}
+
+			aeArgs := AppendEntriesArgs{}
+
+			if rf.getLastIndex() >= rf.nextIndex[server] {
+			        // 补全添加日记的内容
+				entriesNeeded := make([]Entry,0)
+				entriesNeeded = append(entriesNeeded,rf.log[rf.nextIndex[server]-rf.lastSSPointIndex:]...)
+				prevLogIndex,prevLogTerm := rf.getPrevLogInfo(server)
+				aeArgs = AppendEntriesArgs{
+					rf.currentTerm,
+					rf.me,
+					prevLogIndex,
+					prevLogTerm,
+					entriesNeeded,
+					rf.commitIndex,
+				}
+			}else {
+			        // 没有添加日记内容，心跳
+				prevLogIndex,prevLogTerm := rf.getPrevLogInfo(server)
+				aeArgs = AppendEntriesArgs{
+					rf.currentTerm,
+					rf.me,
+					prevLogIndex,
+					prevLogTerm,
+					[] Entry{},
+					rf.commitIndex,
+				}
+			aeReply := AppendEntriesReply{}
+			rf.mu.Unlock()
+
+			re := rf.sendAppendEntries(server,&aeArgs,&aeReply)
+
+			if re == true {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				if rf.state!=LEADER{
+					return
+				}
+
+				if aeReply.Term > rf.currentTerm {
+					rf.currentTerm = aeReply.Term
+					rf.changeState(TO_FOLLOWER,true)
+					return
+				}
+
+				if aeReply.Success {
+					rf.matchIndex[server] = aeArgs.PrevLogIndex + len(aeArgs.Entries)
+					rf.nextIndex[server] = rf.matchIndex[server] + 1
+					rf.updateCommitIndex(LEADER, 0)
+				}
+
+				if !aeReply.Success {
+					if aeReply.ConflictingIndex!= -1 {
+						rf.nextIndex[server] = aeReply.ConflictingIndex
+					}
+				}
+			}
+
+		}(index)
+
+	}
+}
+```
+
+##### leader 提交日记
+一旦leader成功将一条日记复制到集群的大多数机器，那么这条日记就是已提交的（应用状态机）
+
+实现机制：leader维护将要提交的日记记录的索引，并把这个这个索引放到最佳日记的请求中，其它服务结点会从请求中获得这个索引，然后在本地找到这条日记并应用到状态机（执行）。
+
+解决措施：leader强制其它结点只能复制它的日记来解决不一致性，意味着发生冲突时，其它结点的日记会被删除或者重写
+
+值得注意的是，在我们的框架，在给定一个任期内，leader创建的日记索引时单调递增且不重复的。
+
+
+
+#### 持久化
+persistence的作用希望在结点崩溃后可以读取并恢复自身状态，本次lab中需要持久化currentTerm、votedFor，log[]三个变量。可以简单理解为编码(序列化为字节数组)和解码的过程,使用框架提供的labgob实现。
+
+
+#### 日记压缩
+基本思路：使用快照替换之前已经提交的日记。leader使用快照复制给落后的Folower，Follower接受快照信息，删除这个快照并用新的快照取代，如果重复接受，可以删除快照之前的日记，当快照之后的日记需要保留。然而Follower可以在没有leader的情况下进行快照，只是Follower可以重组自己的数据而已，并不违背数据流向（leader  →  Follower）。
+
+实现逻辑：
+1. 如果leader的任期小于自己的任期，return false （抛弃过期的请求）
+2. 创建快照文件，在快照文件中指定偏移量写入数据
+3. 如果不是最后一个块文件，则等待更多的数据
+4. 保存快照文件，删除快照之间的日记，快照之后的日记需要保留
+5. 删除整个日记文件
+6. 使用快照重置状态机，并加载快照
+
+
+
+##### 注意点
+1. 选举时间间隔的选取需要参考论文中的不等式，太小的选举超时间隔会导致选举次数增加，频繁的消耗RPC资源，不能通过B中的测试
+   ![image](https://user-images.githubusercontent.com/79254572/178018554-bcaca818-0491-4b80-832c-90b142fa908a.png)
+   
+2. 注意参考按照TA中的要求加锁，所有涉及到rf.currentTerm或者rf.state都必须加锁，
+
+3. 涉及到time.Sleep()的代码块不要加锁，否者容易导致死锁的发生，但可以在time.Sleep()之后加锁。
+
+
+
+
+
+
+
+
+
+
+
 

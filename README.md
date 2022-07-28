@@ -2,4 +2,4 @@
 
 ## Lab1 MapReduce （Done）
 
-## Lab2 Raft（doing）
+## Lab2 Raft（done）
